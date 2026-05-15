@@ -67,6 +67,8 @@ body {
   display: block;
   width: 100%;
   height: 100%;
+  /* WebGL 未初期化／描画エラーでも真っ暗に見えないよう空に近い色 */
+  background: #87ceeb;
 }
 
 .hidden {

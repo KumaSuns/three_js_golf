@@ -1,4 +1,5 @@
 /* ===== たっくんとGOLF - game.js ===== */
+/* キャッシュ回避の ?v= は index.php が game.js の更新時刻で自動付与する（手動の fixspec 更新は不要） */
 
 // ホール定義
 const HOLES = [
@@ -43,13 +44,17 @@ const CUP_LINER_DEPTH      = BALL_RADIUS * 4.2;
 const CUP_LINER_RADIUS     = CUP_RADIUS * 0.86;
 const CUP_TOTAL_DEPTH      = CUP_SOIL_DEPTH + CUP_LINER_DEPTH;
 const CUP_CAPTURE_RADIUS   = CUP_RADIUS * 0.92;
+const GREEN_INNER_RADIUS   = CUP_RADIUS * 1.35; // カップ穴の外縁（グリーンリング内径）
+const GREEN_OUTER_RADIUS   = 7;                 // パッティンググリーン外周
 const PLAYER_HEIGHT       = 1.65;
 const PLAYER_HEADS        = 5;
 const PLAYER_MODEL_HEAD_R = 0.21;
 
 // ===== 状態変数 =====
 let scene, camera, renderer;
-let ball, holeMesh, flagMesh, arrowMesh;
+/** 影用（方向光）。initThree で生成 */
+let sunLight = null;
+let ball, holeMesh, flagMesh, flagPolePart, flagClothPart, arrowMesh;
 let ballPos    = { x: 0, y: BALL_RADIUS, z: 0 };
 let ballVel    = { x: 0, y: 0, z: 0 };
 let ballInFlight   = false;
@@ -73,11 +78,25 @@ function initSharedMaterials() {
   MAT.leaves  = new THREE.MeshLambertMaterial({ color: 0x1e6e2e });
   MAT.ball    = new THREE.MeshLambertMaterial({ color: 0xffffff });
   MAT.soil    = new THREE.MeshLambertMaterial({ color: 0x6b5340, side: THREE.DoubleSide });
+  MAT.cupInner = new THREE.MeshLambertMaterial({ color: 0x2e2218, side: THREE.DoubleSide });
+  MAT.cupLiner = new THREE.MeshLambertMaterial({ color: 0xb8b8b0, side: THREE.DoubleSide });
   MAT.cloud   = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 });
 }
 let courseMeshes   = [];
 let cameraAngleV   = 0.3;
 let cameraDistance = 18;
+const CAMERA_FOV_PLAY    = 55;
+const CAMERA_FOV_ADDRESS = 58;
+//
+// ── アドレス・キャラ仕様（ここ以外は触らない：カメラの横ずらし・ホール向き強制など無し）
+//   カメラ：打ち出し線 fwd の延長上（ティー側）のみ lookAt はボール
+//   キャラ ：全体 yaw = atan2(足元→ボール)+PLAYER_FACE_YAW_FLIP（前後だけ逆なら 0 と π を入れ替え）
+//   クラブ ：右腕の手首。アドレス中のみ手首→ボールへローカル軸合わせ（setFromUnitVectors。lookAt は使わない）
+// ──
+const ADDRESS_CAM_BEHIND_BALL = 5.0;
+const ADDRESS_CAM_HEIGHT = 1.12;
+/** モデル正面と atan2 が半ズレしているときのみ。試行しない：前後が逆ならこの行だけ 0 ↔ Math.PI */
+const PLAYER_FACE_YAW_FLIP = 0;
 
 let shotState   = SHOT_IDLE;
 let power       = 0;   // 現在のバー値（0〜100）
@@ -91,16 +110,32 @@ const CUP_IN_DROP_FRAMES    = 18;
 const CUP_IN_SETTLE_FRAMES  = 10;
 const CUP_IN_CAM_FRAMES     = 24;
 const CUP_IN_TOTAL_FRAMES   = CUP_IN_ROLL_FRAMES + CUP_IN_DROP_FRAMES + CUP_IN_SETTLE_FRAMES;
-const FOG_NEAR_DEFAULT    = 60;
-const FOG_FAR_DEFAULT     = 200;
+const FOG_NEAR_DEFAULT    = 90;
+const FOG_FAR_DEFAULT     = 320;
 let cupCamFromPos    = null;
 let cupCamToPos      = null;
 let cupCamFromTarget = null;
 let cupCamToTarget   = null;
 let ballCupStart     = { x: 0, y: 0, z: 0 };
 let holeGreenMesh    = null;
-
-let shotStartPos        = { x: 0, z: 0 };
+const greenRaycaster = new THREE.Raycaster();
+const greenRayOrigin = new THREE.Vector3();
+const greenRayDir    = new THREE.Vector3(0, -1, 0);
+const FLAG_WIDTH     = 1.2;
+const FLAG_HEIGHT    = 0.8;
+const FLAG_LOCAL_X   = 0.6;
+const FLAG_LOCAL_Y   = 3.8;
+const _flagLocalBall = new THREE.Vector3();
+const _flagNormal    = new THREE.Vector3();
+const _flagWorldPos  = new THREE.Vector3();
+const _clubHandW      = new THREE.Vector3();
+const _clubBallW      = new THREE.Vector3();
+const _clubDirW       = new THREE.Vector3();
+const _clubDirLocal   = new THREE.Vector3();
+const _clubShaftNegY  = new THREE.Vector3(0, -1, 0);
+const _clubQParent    = new THREE.Quaternion();
+const _clubQParentInv = new THREE.Quaternion();
+const _clubQAlign     = new THREE.Quaternion();
 let showingDistance     = false;
 let preRetryStrokeCount = 0;
 let impactQueued        = false; // インパクト入力を次フレームで確実に処理
@@ -108,9 +143,20 @@ let impactQueued        = false; // インパクト入力を次フレームで�
 // ===== プレイヤー =====
 let playerGroup  = null;
 let playerParts  = {};
-const SWING_ADDR =  0.45;   // アドレス
+// アドレスの腕ピッチ armsGrp.rotation.x（このモデルは小さいほど前）
+const SWING_ADDR = -0.46;
 const SWING_BACK = -1.55;   // バックスウィング
 const SWING_THRU =  2.7;    // フォロースルー
+/** 構え：膝の曲げ（太腿直下 kneeGrp の rotation.x、大きいほどしゃがむ） */
+const ADDRESS_KNEE_X = 0.46;
+/** 構え：肘の曲げ（肘グループ rotation.x。逆に見えたら符号だけ反転） */
+const ADDRESS_ELBOW_X = -0.52;
+/** 靴底がローカル y=0 より下のオフセットに合わせる（スケール前・頭半径ベース） */
+const PLAYER_SOLE_BELOW_ORIGIN = PLAYER_MODEL_HEAD_R * 0.32 - 0.035;
+/** 膝曲げでつま先が沈むときの持ち上げ（ワールド m） */
+const ADDRESS_FOOT_EXTRA_LIFT = 0.02;
+/** 膝を曲げて足首が浮くときだけ少しプラスで沈める。m 単位 */
+const ADDRESS_STANCE_LOWER_Y = 0;
 let swingAngle   = SWING_ADDR;
 let swingTarget  = SWING_ADDR;
 
@@ -118,6 +164,9 @@ const GRAVITY = -0.018;
 const FRICTION = 0.97;
 const BOUNCE   = 0.35;
 const POLE_RADIUS = 0.05; // ポール半径（m）
+// ショット後のボール・カップイン演出の時間倍率（小さいほどゆっくり）
+const BALL_FLIGHT_SCALE = 0.68;
+const SHOT_DISTANCE_DELAY_MS = 400;
 
 // ===== DOM =====
 const titleScreen    = document.getElementById('title-screen');
@@ -182,19 +231,34 @@ function initThree() {
   });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
+  renderer.setClearColor(0x87ceeb, 1);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x87ceeb);
-  scene.fog = new THREE.Fog(0x87ceeb, 60, 200);
+  scene.fog = new THREE.Fog(0x87ceeb, FOG_NEAR_DEFAULT, FOG_FAR_DEFAULT);
 
-  camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 500);
+  camera = new THREE.PerspectiveCamera(CAMERA_FOV_PLAY, window.innerWidth / window.innerHeight, 0.1, 500);
 
-  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  scene.add(new THREE.AmbientLight(0xffffff, 0.78));
   scene.add(new THREE.HemisphereLight(0x87ceeb, 0x3a9a4a, 0.35));
 
-  const sun = new THREE.DirectionalLight(0xfff8e7, 1.0);
-  sun.position.set(30, 60, 30);
-  scene.add(sun);
+  sunLight = new THREE.DirectionalLight(0xfff8e7, 1.0);
+  sunLight.position.set(30, 60, 30);
+  sunLight.castShadow = true;
+  sunLight.shadow.mapSize.set(2048, 2048);
+  sunLight.shadow.camera.near = 0.5;
+  sunLight.shadow.camera.far = 220;
+  const sh = 95;
+  sunLight.shadow.camera.left = -sh;
+  sunLight.shadow.camera.right = sh;
+  sunLight.shadow.camera.top = sh;
+  sunLight.shadow.camera.bottom = -sh;
+  sunLight.shadow.bias = -0.00015;
+  sunLight.shadow.normalBias = 0.035;
+  sunLight.shadow.camera.updateProjectionMatrix();
+  scene.add(sunLight);
 
   addClouds();
 
@@ -230,7 +294,6 @@ function loadHole(idx) {
   hideCupInEffect();
   if (playerGroup) playerGroup.visible = true;
   gameScreen.classList.remove('cup-in-active');
-  shotDirection   = 0;
   cameraAngleV    = 0.3;
   shotStartPos    = { x: 0, z: 0 };
   showingDistance = false;
@@ -252,12 +315,18 @@ function loadHole(idx) {
 
   buildCourse(hole);
   placeBall(hole.ballStart.x, hole.ballStart.z);
+  aimAtGreen();
   placeHole(hole.holePos.x, hole.holePos.z);
   buildArrow();
   buildPlayer();
   updateGaugeLabels();
   updateHUD();
   updateShotUI();
+  updateFlagVisibility();
+
+  updateArrow();
+  updateCamera();
+  renderer.render(scene, camera);
 
   lastFrameMs = 0;
   if (!animId) gameLoop(performance.now());
@@ -268,27 +337,71 @@ function buildCourse(hole) {
   const W = 30, L = hole.terrain === 'hill' ? 180 : 130;
 
   const fairway = new THREE.Mesh(buildTerrainGeometry(W, L, hole.terrain), MAT.fairway);
+  fairway.receiveShadow = true;
+  carveCupOpening(fairway, hole.holePos.x, hole.holePos.z, CUP_RADIUS * 1.15);
   scene.add(fairway);
   courseMeshes.push(fairway);
 
+  // カップ直上を避け、外側だけを明るいグリーンにする（中央に緑の蓋が乗らない）
+  const greenY = getGroundY(hole.holePos.z) + 0.003;
   const green = new THREE.Mesh(
-    new THREE.RingGeometry(CUP_RADIUS * 1.06, 7, 32),
+    new THREE.RingGeometry(GREEN_INNER_RADIUS, GREEN_OUTER_RADIUS, 48),
     MAT.green
   );
   green.rotation.x = -Math.PI / 2;
-  green.position.set(hole.holePos.x, 0.011, hole.holePos.z);
+  green.position.set(hole.holePos.x, greenY, hole.holePos.z);
+  green.receiveShadow = true;
   scene.add(green);
   courseMeshes.push(green);
   holeGreenMesh = green;
 
   const rough = new THREE.Mesh(new THREE.PlaneGeometry(100, L + 40), MAT.rough);
+  rough.receiveShadow = true;
   rough.rotation.x = -Math.PI / 2;
-  rough.position.set(0, -0.02, (hole.ballStart.z + hole.holePos.z) / 2);
+  const roughMidZ = (hole.ballStart.z + hole.holePos.z) / 2;
+  rough.position.set(0, -0.02, roughMidZ);
+  carveCupOpening(rough, hole.holePos.x, hole.holePos.z - roughMidZ, CUP_RADIUS * 1.12);
   scene.add(rough);
   courseMeshes.push(rough);
 
   addBunkers(hole);
   addTrees(hole);
+}
+
+// フェアウェイがカップ口を塞がないよう、カップ位置の面だけくり抜く（くぼみは付けない）
+function carveCupOpening(mesh, cupX, cupZ, radius) {
+  const geo = mesh.geometry;
+  const pos = geo.attributes.position;
+  const r2 = radius * radius;
+  const index = geo.index;
+  if (!index) {
+    geo.computeVertexNormals();
+    return;
+  }
+
+  const idx = index.array;
+  const vA = new THREE.Vector3();
+  const vB = new THREE.Vector3();
+  const vC = new THREE.Vector3();
+  const newIdx = [];
+
+  for (let i = 0; i < index.count; i += 3) {
+    const ia = idx[i];
+    const ib = idx[i + 1];
+    const ic = idx[i + 2];
+    vA.fromBufferAttribute(pos, ia);
+    vB.fromBufferAttribute(pos, ib);
+    vC.fromBufferAttribute(pos, ic);
+    const cx = (vA.x + vB.x + vC.x) / 3;
+    const cz = (vA.z + vB.z + vC.z) / 3;
+    const dx = cx - cupX;
+    const dz = cz - cupZ;
+    if (dx * dx + dz * dz < r2) continue;
+    newIdx.push(ia, ib, ic);
+  }
+
+  geo.setIndex(newIdx);
+  geo.computeVertexNormals();
 }
 
 function buildTerrainGeometry(W, L, type) {
@@ -313,6 +426,7 @@ function addBunkers(hole) {
   const mid = (hole.ballStart.z + hole.holePos.z) / 2;
   [[8, mid - 10], [-8, mid + 10]].forEach(([x, z]) => {
     const mesh = new THREE.Mesh(new THREE.CircleGeometry(1, 12), MAT.bunker);
+    mesh.receiveShadow = true;
     mesh.scale.set(4, 3, 1);
     mesh.rotation.x = -Math.PI / 2;
     mesh.position.set(x, 0.02, z);
@@ -325,11 +439,15 @@ function addTrees(hole) {
   const mid = (hole.ballStart.z + hole.holePos.z) / 2;
   [[16,mid-20],[-16,mid-10],[17,mid+15],[-17,mid+5],[15,mid-35],[-15,mid+30]].forEach(([x,z]) => {
     const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.5, 3, 6), MAT.trunk);
+    trunk.castShadow = true;
+    trunk.receiveShadow = true;
     trunk.position.set(x, 1.5, z);
     scene.add(trunk);
     courseMeshes.push(trunk);
 
     const leaves = new THREE.Mesh(new THREE.ConeGeometry(2.5, 5, 6), MAT.leaves);
+    leaves.castShadow = true;
+    leaves.receiveShadow = true;
     leaves.position.set(x, 6, z);
     scene.add(leaves);
     courseMeshes.push(leaves);
@@ -343,35 +461,52 @@ function placeBall(x, z) {
   ball.scale.setScalar(1);
   ballPos = { x, y: BALL_RADIUS, z };
   ball.position.set(x, BALL_RADIUS, z);
+  ball.castShadow = true;
+  ball.receiveShadow = true;
   scene.add(ball);
 }
 
 // ===== ホール＆フラッグ =====
-// 構造: 芝生面 → 土壁（暗） → 白いプラスチックライナー（沈み込み）
+// 穴口（暗い円）→ 漏斗内壁 → ライナー → 底面
 function placeHole(x, z) {
   holeMesh = new THREE.Group();
 
-  const soil = new THREE.Mesh(
-    new THREE.CylinderGeometry(CUP_RADIUS, CUP_RADIUS * 1.03, CUP_SOIL_DEPTH, 16, 1, true),
-    MAT.soil
+  // 地面の穴口（#2e2218）。低いカメラ角でも「緑の蓋」に見えない
+  const cupOpening = new THREE.Mesh(
+    new THREE.CircleGeometry(CUP_RADIUS * 0.98, 32),
+    MAT.cupInner
   );
-  soil.position.y = -CUP_SOIL_DEPTH / 2;
-  holeMesh.add(soil);
+  cupOpening.rotation.x = -Math.PI / 2;
+  cupOpening.position.y = 0.002;
+  holeMesh.add(cupOpening);
 
-  const linerMat = new THREE.MeshLambertMaterial({
-    color: 0xd8d8d0,
-    side: THREE.DoubleSide,
-  });
-  const liner = new THREE.Mesh(
-    new THREE.CylinderGeometry(CUP_LINER_RADIUS, CUP_LINER_RADIUS * 0.97, CUP_LINER_DEPTH, 16, 1, true),
-    linerMat
+  const cupWell = new THREE.Mesh(
+    new THREE.CylinderGeometry(
+      CUP_RADIUS * 0.98,
+      CUP_LINER_RADIUS * 0.9,
+      CUP_TOTAL_DEPTH,
+      24, 1, true
+    ),
+    MAT.cupInner
   );
-  liner.position.y = -CUP_SOIL_DEPTH - CUP_LINER_DEPTH / 2;
-  holeMesh.add(liner);
+  cupWell.position.y = -CUP_TOTAL_DEPTH / 2;
+  holeMesh.add(cupWell);
+
+  const linerSection = new THREE.Mesh(
+    new THREE.CylinderGeometry(
+      CUP_LINER_RADIUS * 0.9,
+      CUP_LINER_RADIUS * 0.85,
+      CUP_LINER_DEPTH * 0.55,
+      16, 1, true
+    ),
+    MAT.cupLiner
+  );
+  linerSection.position.y = -CUP_SOIL_DEPTH - CUP_LINER_DEPTH * 0.28;
+  holeMesh.add(linerSection);
 
   const linerBottom = new THREE.Mesh(
-    new THREE.CircleGeometry(CUP_LINER_RADIUS * 0.97, 16),
-    new THREE.MeshLambertMaterial({ color: 0xcccccc })
+    new THREE.CircleGeometry(CUP_LINER_RADIUS * 0.85, 16),
+    MAT.cupLiner
   );
   linerBottom.rotation.x = -Math.PI / 2;
   linerBottom.position.y = -CUP_TOTAL_DEPTH + 0.006;
@@ -385,33 +520,28 @@ function placeHole(x, z) {
   drain.position.y = -CUP_TOTAL_DEPTH + 0.007;
   holeMesh.add(drain);
 
-  const grassLip = new THREE.Mesh(
-    new THREE.TorusGeometry(CUP_RADIUS, CUP_RADIUS * 0.04, 8, 24),
-    new THREE.MeshLambertMaterial({ color: 0x4ccc4c })
-  );
-  grassLip.rotation.x = Math.PI / 2;
-  grassLip.position.y = 0.003;
-  holeMesh.add(grassLip);
-
-  holeMesh.position.set(x, 0, z);
+  holeMesh.position.set(x, getGroundY(z), z);
+  holeMesh.traverse(obj => {
+    if (obj.isMesh) obj.receiveShadow = true;
+  });
   scene.add(holeMesh);
 
   flagMesh = new THREE.Group();
-  const pole = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.05, 0.05, 4, 8),
+  flagPolePart = new THREE.Mesh(
+    new THREE.CylinderGeometry(POLE_RADIUS, POLE_RADIUS, 4, 8),
     new THREE.MeshLambertMaterial({ color: 0xcccccc })
   );
-  pole.position.y = 2;
-  flagMesh.add(pole);
+  flagPolePart.position.y = 2;
+  flagMesh.add(flagPolePart);
 
-  const flag = new THREE.Mesh(
-    new THREE.PlaneGeometry(1.2, 0.8),
+  flagClothPart = new THREE.Mesh(
+    new THREE.PlaneGeometry(FLAG_WIDTH, FLAG_HEIGHT),
     new THREE.MeshLambertMaterial({ color: 0xff2222, side: THREE.DoubleSide })
   );
-  flag.position.set(0.6, 3.8, 0);
-  flagMesh.add(flag);
+  flagClothPart.position.set(FLAG_LOCAL_X, FLAG_LOCAL_Y, 0);
+  flagMesh.add(flagClothPart);
 
-  flagMesh.position.set(x, 0, z);
+  flagMesh.position.set(x, getGroundY(z), z);
   scene.add(flagMesh);
 }
 
@@ -433,7 +563,9 @@ function buildArrow() {
   scene.add(arrowMesh);
 }
 
-// ===== プレイヤー生成 =====
+// ===== プレイヤー（キャラ）— 向き・腕・クラブはここから追う =====
+//   buildPlayer → updatePlayerTransform → updatePlayer
+//   クラブ向き: updateClubAddressOrientation ／ カメラ: updateAddressCamera
 function buildPlayer() {
   if (playerGroup) scene.remove(playerGroup);
   playerParts = {};
@@ -448,6 +580,7 @@ function buildPlayer() {
   const mGlove = new THREE.MeshLambertMaterial({ color: 0xf0f0f0 });
   const mShaft = new THREE.MeshLambertMaterial({ color: 0xc0c0c0 });
   const mClub  = new THREE.MeshLambertMaterial({ color: 0x777777 });
+  const mEye   = new THREE.MeshLambertMaterial({ color: 0x1a1a22 });
 
   function mk(geo, mat, px, py, pz) {
     const m = new THREE.Mesh(geo, mat);
@@ -461,18 +594,38 @@ function buildPlayer() {
   const hr = PLAYER_MODEL_HEAD_R;
   const legH = hr * 2.6;
   const hipY = 0.035 + legH + 0.11;
+  const uLegH = legH * 0.54;
+  const lLegH = legH * 0.46;
+  const hipLineY = 0.035 + legH;
 
-  // 靴
-  playerGroup.add(mk(B(hr * 0.65, hr * 0.32, hr * 1.1), mShoe, -hr * 0.65, hr * 0.16, hr * 0.18));
-  playerGroup.add(mk(B(hr * 0.65, hr * 0.32, hr * 1.1), mShoe,  hr * 0.65, hr * 0.16, hr * 0.18));
-  // 脚（5頭身用に短め）
-  playerGroup.add(mk(C(hr * 0.42, hr * 0.4, legH, 8), mPants, -hr * 0.65, 0.035 + legH * 0.5));
-  playerGroup.add(mk(C(hr * 0.42, hr * 0.4, legH, 8), mPants,  hr * 0.65, 0.035 + legH * 0.5));
+  function buildLeg(side) {
+    const sx = side * hr * 0.65;
+    const legRoot = new THREE.Group();
+    legRoot.position.set(sx, hipLineY, 0);
+    playerGroup.add(legRoot);
+    legRoot.add(mk(C(hr * 0.42, hr * 0.38, uLegH, 8), mPants, 0, -uLegH * 0.5, 0));
+    const kneeGrp = new THREE.Group();
+    kneeGrp.position.set(0, -uLegH, 0);
+    kneeGrp.rotation.x = ADDRESS_KNEE_X;
+    legRoot.add(kneeGrp);
+    kneeGrp.add(mk(C(hr * 0.39, hr * 0.36, lLegH, 8), mPants, 0, -lLegH * 0.5, 0));
+    kneeGrp.add(mk(B(hr * 0.65, hr * 0.32, hr * 1.1), mShoe, 0, -lLegH - hr * 0.16, hr * 0.18));
+    if (side < 0) {
+      playerParts.lLegRoot = legRoot;
+      playerParts.lKneeGrp = kneeGrp;
+    } else {
+      playerParts.rLegRoot = legRoot;
+      playerParts.rKneeGrp = kneeGrp;
+    }
+  }
+  buildLeg(-1);
+  buildLeg(1);
+
   playerGroup.add(mk(B(hr * 1.95, hr * 1.0, hr * 1.2), mPants, 0, hipY));
 
   const bodyGrp = new THREE.Group();
   bodyGrp.position.set(0, hipY + hr * 0.35, 0);
-  bodyGrp.rotation.x = 0.2;
+  bodyGrp.rotation.x = 0;
   playerGroup.add(bodyGrp);
   playerParts.bodyGrp = bodyGrp;
 
@@ -481,6 +634,10 @@ function buildPlayer() {
   const headMesh = mk(Sp(hr, 14), mSkin, 0, hr * 3.55);
   bodyGrp.add(headMesh);
   playerParts.headMesh = headMesh;
+  // 目（頭の +Z 側＝ボール向きと揃えやすい）
+  const eyeR = hr * 0.11;
+  bodyGrp.add(mk(Sp(eyeR, 8), mEye, -hr * 0.36, hr * 3.62, hr * 0.82));
+  bodyGrp.add(mk(Sp(eyeR, 8), mEye,  hr * 0.36, hr * 3.62, hr * 0.82));
   bodyGrp.add(mk(Sp(hr * 0.3, 6), mSkin, -hr * 1.0, hr * 3.55));
   bodyGrp.add(mk(Sp(hr * 0.3, 6), mSkin,  hr * 1.0, hr * 3.55));
   bodyGrp.add(mk(C(hr * 0.68, hr * 1.05, hr * 1.0, 8), mCap, 0, hr * 4.45));
@@ -491,23 +648,39 @@ function buildPlayer() {
   bodyGrp.add(armsGrp);
   playerParts.armsGrp = armsGrp;
 
+  const uArmLen = hr * 1.1;
+  const foreLen = hr * 1.86;
+
   const lArmGrp = new THREE.Group();
   lArmGrp.position.set(-hr * 1.28, 0, 0);
   armsGrp.add(lArmGrp);
-  lArmGrp.add(mk(C(hr * 0.33, hr * 0.3, hr * 1.35, 8), mShirt, 0, -hr * 0.68));
-  lArmGrp.add(mk(C(hr * 0.28, hr * 0.25, hr * 1.25, 8), mSkin, 0, -hr * 1.98));
-  lArmGrp.add(mk(Sp(hr * 0.36, 8), mGlove, 0, -hr * 2.78));
+  playerParts.lArmGrp = lArmGrp;
+  lArmGrp.add(mk(C(hr * 0.33, hr * 0.3, uArmLen, 8), mShirt, 0, -uArmLen * 0.52, 0));
+  const lElbowGrp = new THREE.Group();
+  lElbowGrp.position.set(0, -uArmLen, 0);
+  lElbowGrp.rotation.x = ADDRESS_ELBOW_X;
+  lArmGrp.add(lElbowGrp);
+  playerParts.lElbowGrp = lElbowGrp;
+  lElbowGrp.add(mk(C(hr * 0.28, hr * 0.25, foreLen, 8), mSkin, 0, -foreLen * 0.5, 0));
+  lElbowGrp.add(mk(Sp(hr * 0.36, 8), mGlove, 0, -foreLen * 0.94, 0));
 
   const rArmGrp = new THREE.Group();
   rArmGrp.position.set(hr * 1.28, 0, 0);
   armsGrp.add(rArmGrp);
-  rArmGrp.add(mk(C(hr * 0.33, hr * 0.3, hr * 1.35, 8), mShirt, 0, -hr * 0.68));
-  rArmGrp.add(mk(C(hr * 0.28, hr * 0.25, hr * 1.25, 8), mSkin, 0, -hr * 1.98));
-  rArmGrp.add(mk(Sp(hr * 0.36, 8), mGlove, 0, -hr * 2.78));
+  playerParts.rArmGrp = rArmGrp;
+  rArmGrp.add(mk(C(hr * 0.33, hr * 0.3, uArmLen, 8), mShirt, 0, -uArmLen * 0.52, 0));
+  const rElbowGrp = new THREE.Group();
+  rElbowGrp.position.set(0, -uArmLen, 0);
+  rElbowGrp.rotation.x = ADDRESS_ELBOW_X;
+  rArmGrp.add(rElbowGrp);
+  playerParts.rElbowGrp = rElbowGrp;
+  rElbowGrp.add(mk(C(hr * 0.28, hr * 0.25, foreLen, 8), mSkin, 0, -foreLen * 0.5, 0));
+  rElbowGrp.add(mk(Sp(hr * 0.36, 8), mGlove, 0, -foreLen * 0.94, 0));
 
   const clubGrp = new THREE.Group();
-  clubGrp.position.set(0, -hr * 2.95, 0);
-  rArmGrp.add(clubGrp);
+  clubGrp.position.set(0, -foreLen * 0.88, 0);
+  clubGrp.quaternion.identity();
+  rElbowGrp.add(clubGrp);
   playerParts.clubGrp = clubGrp;
   clubGrp.add(mk(C(hr * 0.08, hr * 0.07, hr * 4.9, 6), mShaft, 0, -hr * 2.45));
   clubGrp.add(mk(B(hr * 0.22, hr * 0.45, hr * 0.4), mClub, 0, -hr * 5.0, hr * 0.08));
@@ -516,25 +689,81 @@ function buildPlayer() {
 
   // 全高 = 頭直径 × 5（5頭身）
   playerGroup.scale.setScalar(PLAYER_HEIGHT / (PLAYER_HEADS * PLAYER_MODEL_HEAD_R * 2));
+  playerGroup.traverse(obj => {
+    if (obj.isMesh) {
+      obj.castShadow = true;
+      obj.receiveShadow = false;
+    }
+  });
   scene.add(playerGroup);
   updatePlayerTransform();
 }
 
+function getShotBasis() {
+  return {
+    fwd:   { x: Math.sin(shotDirection), z: -Math.cos(shotDirection) },
+    right: { x: Math.cos(shotDirection), z: Math.sin(shotDirection) },
+  };
+}
+
+function aimAtGreen() {
+  const hole = HOLES[currentHoleIndex];
+  const dx = hole.holePos.x - ballPos.x;
+  const dz = hole.holePos.z - ballPos.z;
+  shotDirection = Math.atan2(dx, -dz);
+}
+
+function getPlayerFeetAlignY(groundY) {
+  if (!playerGroup) return groundY - ADDRESS_STANCE_LOWER_Y;
+  const lift =
+    PLAYER_SOLE_BELOW_ORIGIN * playerGroup.scale.x + ADDRESS_FOOT_EXTRA_LIFT;
+  return groundY + lift - ADDRESS_STANCE_LOWER_Y;
+}
+
 function updatePlayerTransform() {
   if (!playerGroup) return;
-  const fwd   = { x:  Math.sin(shotDirection), z: -Math.cos(shotDirection) };
-  const right = { x:  Math.cos(shotDirection), z:  Math.sin(shotDirection) };
+  const { right } = getShotBasis();
   const stanceR = PLAYER_HEIGHT * 0.33;
-  const stanceB = PLAYER_HEIGHT * 0.15;
+  const groundY = getGroundY(ballPos.z);
+  const feetY = getPlayerFeetAlignY(groundY);
+  // 右打ち：ボールの左側
   playerGroup.position.set(
-    ballPos.x + right.x * stanceR - fwd.x * stanceB,
-    0,
-    ballPos.z + right.z * stanceR - fwd.z * stanceB
+    ballPos.x - right.x * stanceR,
+    feetY,
+    ballPos.z - right.z * stanceR
   );
-  // ボールの方向を向く
-  const dx = ballPos.x - playerGroup.position.x;
-  const dz = ballPos.z - playerGroup.position.z;
-  playerGroup.rotation.y = Math.atan2(dx, -dz) + Math.PI;
+  const px = playerGroup.position.x;
+  const pz = playerGroup.position.z;
+  const dx = ballPos.x - px;
+  const dz = ballPos.z - pz;
+  playerGroup.rotation.y = Math.atan2(dx, dz) + PLAYER_FACE_YAW_FLIP;
+}
+
+/** アドレス中のみ：シャフト（ローカル −Y）を手首からボールへ向ける */
+function updateClubAddressOrientation() {
+  const club = playerParts.clubGrp;
+  if (!club || !playerGroup) return;
+  if (ballInFlight || cupInProgress || showingDistance) return;
+  if (shotState !== SHOT_IDLE && shotState !== SHOT_POWER) return;
+
+  club.updateMatrixWorld(true);
+  club.getWorldPosition(_clubHandW);
+  _clubBallW.set(ballPos.x, ballPos.y, ballPos.z);
+  _clubDirW.subVectors(_clubBallW, _clubHandW);
+  const len = _clubDirW.length();
+  if (len < 1e-5) return;
+  _clubDirW.multiplyScalar(1 / len);
+
+  const arm = club.parent;
+  if (!arm) return;
+  arm.updateMatrixWorld(true);
+  arm.getWorldQuaternion(_clubQParent);
+  _clubQParentInv.copy(_clubQParent).invert();
+  _clubDirLocal.copy(_clubDirW).applyQuaternion(_clubQParentInv);
+
+  _clubQAlign.setFromUnitVectors(_clubShaftNegY, _clubDirLocal);
+  if (!Number.isFinite(_clubQAlign.x + _clubQAlign.y + _clubQAlign.z + _clubQAlign.w)) return;
+  club.quaternion.copy(_clubQAlign);
 }
 
 function updatePlayer(dt) {
@@ -544,6 +773,9 @@ function updatePlayer(dt) {
     updatePlayerTransform();
     swingTarget = SWING_ADDR;
     if (playerParts.bodyGrp) playerParts.bodyGrp.rotation.y = 0;
+  } else {
+    if (playerParts.lArmGrp) playerParts.lArmGrp.rotation.y = 0;
+    if (playerParts.rArmGrp) playerParts.rArmGrp.rotation.y = 0;
   }
 
   if (shotState === SHOT_SWING) {
@@ -560,11 +792,34 @@ function updatePlayer(dt) {
 
   if (ballInFlight) swingTarget = SWING_THRU;
 
+  const atAddressReady =
+    !ballInFlight &&
+    !cupInProgress &&
+    !showingDistance &&
+    (shotState === SHOT_IDLE || shotState === SHOT_POWER);
+  if (atAddressReady) {
+    swingAngle = SWING_ADDR;
+    swingTarget = SWING_ADDR;
+  }
+
   swingAngle += (swingTarget - swingAngle) * (ballInFlight ? 0.04 : 0.16) * dt;
   if (playerParts.armsGrp) playerParts.armsGrp.rotation.x = swingAngle;
 
+  if (
+    !ballInFlight &&
+    (shotState === SHOT_IDLE || shotState === SHOT_POWER) &&
+    !cupInProgress &&
+    !showingDistance
+  ) {
+    updateClubAddressOrientation();
+  } else if (playerParts.clubGrp) {
+    playerParts.clubGrp.quaternion.identity();
+  }
+
   if (shotState === SHOT_IDLE && !ballInFlight) {
-    playerGroup.position.y = Math.sin(Date.now() * 0.0016) * 0.012;
+    playerGroup.position.y =
+      getPlayerFeetAlignY(getGroundY(ballPos.z)) +
+      Math.sin(Date.now() * 0.0016) * 0.012;
   }
 }
 
@@ -596,19 +851,68 @@ function updateHUD() {
 }
 
 // ===== カメラ =====
-function updateCamera() {
+function setCameraFov(fov) {
+  if (camera.fov === fov) return;
+  camera.fov = fov;
+  camera.updateProjectionMatrix();
+}
+
+function isAddressCameraActive() {
+  return !ballInFlight && !cupInProgress && !showingDistance;
+}
+
+function updateAddressCamera() {
+  const { fwd } = getShotBasis();
+  const putt = isPutterClub();
+  const backD  = putt ? 2.4 : ADDRESS_CAM_BEHIND_BALL;
+  const height = (putt ? 0.9 : ADDRESS_CAM_HEIGHT) + (cameraAngleV - 0.3) * 2;
+  const groundY = getGroundY(ballPos.z);
+  const lookY = groundY + BALL_RADIUS;
+
+  // 打ち出し線そのもの（ボール〜ホール）の延長上、ティー側。斜め見せはしない。
+  camera.position.set(
+    ballPos.x - fwd.x * backD,
+    groundY + height,
+    ballPos.z - fwd.z * backD
+  );
+  camera.lookAt(ballPos.x, lookY, ballPos.z);
+  setCameraFov(putt ? 52 : CAMERA_FOV_ADDRESS);
+}
+
+function updateFollowCamera() {
   const cx = ballPos.x - Math.sin(shotDirection) * cameraDistance * Math.cos(cameraAngleV);
   const cy = ballPos.y + cameraDistance * Math.sin(cameraAngleV);
   const cz = ballPos.z + Math.cos(shotDirection) * cameraDistance * Math.cos(cameraAngleV);
   camera.position.set(cx, cy, cz);
-  // プレイヤーとボールが両方映るよう右へ少しシフト
   const rx = Math.cos(shotDirection) * 0.4;
   const rz = Math.sin(shotDirection) * 0.4;
   camera.lookAt(ballPos.x + rx, ballPos.y + 0.9, ballPos.z + rz);
+  setCameraFov(CAMERA_FOV_PLAY);
+}
+
+function updateCamera() {
+  if (isAddressCameraActive()) updateAddressCamera();
+  else updateFollowCamera();
 }
 
 function isPutterClub() {
   return CLUBS[currentClub].name === 'PT';
+}
+
+function isBallOnGreen() {
+  if (!holeGreenMesh || ballInFlight) return false;
+
+  greenRayOrigin.set(ballPos.x, ballPos.y + 0.5, ballPos.z);
+  greenRaycaster.set(greenRayOrigin, greenRayDir);
+  const hit = greenRaycaster.intersectObject(holeGreenMesh, false)[0];
+  if (!hit) return false;
+  // ボールの真下近くでグリーン面に当たっている＝グリーン上
+  return hit.distance <= ballPos.y + 0.12;
+}
+
+function updateFlagVisibility() {
+  if (!flagMesh) return;
+  flagMesh.visible = !cupInProgress && !isBallOnGreen();
 }
 
 function updateShotUI() {
@@ -856,27 +1160,75 @@ function updateShotMeters(dt) {
   }
 }
 
-// ===== ポール当たり判定 =====
-function checkPoleCollision() {
+// ===== 旗竿・旗の当たり判定 =====
+function isNearCupForFlagHit() {
   const hole = HOLES[currentHoleIndex];
-  const dx = ballPos.x - hole.holePos.x;
-  const dz = ballPos.z - hole.holePos.z;
-  const distXZ = Math.sqrt(dx * dx + dz * dz);
-  if (distXZ < CUP_CAPTURE_RADIUS) return; // カップ付近はポール判定をスキップ
+  return Math.hypot(ballPos.x - hole.holePos.x, ballPos.z - hole.holePos.z) < CUP_CAPTURE_RADIUS;
+}
+
+function checkPoleCollision() {
+  if (!flagMesh || !flagMesh.visible || isNearCupForFlagHit()) return;
+
+  const px = flagMesh.position.x;
+  const pz = flagMesh.position.z;
+  const dx = ballPos.x - px;
+  const dz = ballPos.z - pz;
+  const distXZ = Math.hypot(dx, dz);
+  if (distXZ < 1e-6) return;
 
   const threshold = POLE_RADIUS + BALL_RADIUS;
   if (distXZ < threshold && ballPos.y > 0 && ballPos.y < 4.5) {
     const nx = dx / distXZ;
     const nz = dz / distXZ;
     const dot = ballVel.x * nx + ballVel.z * nz;
-    if (dot < 0) { // ポールへ向かっているときだけ反射
+    if (dot < 0) {
       ballVel.x = (ballVel.x - 2 * dot * nx) * 0.55;
       ballVel.z = (ballVel.z - 2 * dot * nz) * 0.55;
     }
-    // めり込み解消
-    ballPos.x = hole.holePos.x + nx * (threshold + 0.02);
-    ballPos.z = hole.holePos.z + nz * (threshold + 0.02);
+    ballPos.x = px + nx * (threshold + 0.02);
+    ballPos.z = pz + nz * (threshold + 0.02);
   }
+}
+
+function checkFlagClothCollision() {
+  if (!flagMesh || !flagMesh.visible || !flagClothPart || isNearCupForFlagHit()) return;
+
+  _flagLocalBall.set(ballPos.x, ballPos.y, ballPos.z);
+  flagMesh.worldToLocal(_flagLocalBall);
+
+  const pad = BALL_RADIUS + 0.03;
+  const halfW = FLAG_WIDTH * 0.5 + pad;
+  const halfH = FLAG_HEIGHT * 0.5 + pad;
+  if (Math.abs(_flagLocalBall.z) > pad) return;
+  if (_flagLocalBall.x < FLAG_LOCAL_X - halfW || _flagLocalBall.x > FLAG_LOCAL_X + halfW) return;
+  if (_flagLocalBall.y < FLAG_LOCAL_Y - halfH || _flagLocalBall.y > FLAG_LOCAL_Y + halfH) return;
+
+  const side = _flagLocalBall.z >= 0 ? 1 : -1;
+  _flagNormal.set(0, 0, side).transformDirection(flagMesh.matrixWorld).normalize();
+  const dot = ballVel.x * _flagNormal.x + ballVel.y * _flagNormal.y + ballVel.z * _flagNormal.z;
+  if (dot < 0) {
+    ballVel.x = (ballVel.x - 2 * dot * _flagNormal.x) * 0.55;
+    ballVel.y = (ballVel.y - 2 * dot * _flagNormal.y) * 0.55;
+    ballVel.z = (ballVel.z - 2 * dot * _flagNormal.z) * 0.55;
+  }
+
+  _flagWorldPos.set(FLAG_LOCAL_X, FLAG_LOCAL_Y, 0).applyMatrix4(flagMesh.matrixWorld);
+  const ox = ballPos.x - _flagWorldPos.x;
+  const oy = ballPos.y - _flagWorldPos.y;
+  const oz = ballPos.z - _flagWorldPos.z;
+  const distN = ox * _flagNormal.x + oy * _flagNormal.y + oz * _flagNormal.z;
+  const push = pad - Math.abs(distN);
+  if (push > 0) {
+    const sign = distN >= 0 ? 1 : -1;
+    ballPos.x += _flagNormal.x * sign * push;
+    ballPos.y += _flagNormal.y * sign * push;
+    ballPos.z += _flagNormal.z * sign * push;
+  }
+}
+
+function checkFlagObstacleCollision() {
+  checkPoleCollision();
+  checkFlagClothCollision();
 }
 
 // ===== カップイン演出（寄りカメラ・ボール沈み） =====
@@ -970,7 +1322,7 @@ function updateCupIn(dt) {
   const hole = HOLES[currentHoleIndex];
   const hx = hole.holePos.x;
   const hz = hole.holePos.z;
-  cupInTimer += dt;
+  cupInTimer += dt * BALL_FLIGHT_SCALE;
 
   const mouthR     = cupMouthRadius();
   const lipDist    = CUP_RADIUS + BALL_RADIUS * 0.35;
@@ -1050,13 +1402,15 @@ function updateBall(dt) {
   if (cupInProgress) { updateCupIn(dt); return; }
   if (!ballInFlight) return;
 
-  ballVel.y += GRAVITY * dt;
-  ballPos.x += ballVel.x * dt;
-  ballPos.y += ballVel.y * dt;
-  ballPos.z += ballVel.z * dt;
+  const bdt = dt * BALL_FLIGHT_SCALE;
 
-  // ポール当たり判定
-  checkPoleCollision();
+  ballVel.y += GRAVITY * bdt;
+  ballPos.x += ballVel.x * bdt;
+  ballPos.y += ballVel.y * bdt;
+  ballPos.z += ballVel.z * bdt;
+
+  // 旗竿・旗の当たり判定
+  checkFlagObstacleCollision();
 
   // 地面近くでカップ範囲に入ったら吸い込む
   if (ballPos.y < 0.5) {
@@ -1077,20 +1431,25 @@ function updateBall(dt) {
     } else {
       ballVel.y = 0;
     }
-    ballVel.x *= FRICTION;
-    ballVel.z *= FRICTION;
+    const rollFriction = Math.pow(FRICTION, bdt);
+    ballVel.x *= rollFriction;
+    ballVel.z *= rollFriction;
     if (Math.abs(ballVel.x) < 0.001 && Math.abs(ballVel.z) < 0.001 && Math.abs(ballVel.y) < 0.005) {
       ballVel = { x: 0, y: 0, z: 0 };
       ballInFlight = false;
       if (strokeCount >= 1) aimAtHole();
       checkHole();
-      if (!cupInProgress) showShotDistance();
+      if (!cupInProgress) {
+        setTimeout(() => {
+          if (!ballInFlight && !cupInProgress && !showingDistance) showShotDistance();
+        }, SHOT_DISTANCE_DELAY_MS);
+      }
     }
   }
 
   ball.position.set(ballPos.x, ballPos.y, ballPos.z);
-  ball.rotation.x += ballVel.z * 5 * dt;
-  ball.rotation.z -= ballVel.x * 5 * dt;
+  ball.rotation.x += ballVel.z * 5 * bdt;
+  ball.rotation.z -= ballVel.x * 5 * bdt;
 }
 
 function getGroundY(z) {
@@ -1102,10 +1461,7 @@ function getGroundY(z) {
 
 // ===== カップ方向へ自動照準 =====
 function aimAtHole() {
-  const hole = HOLES[currentHoleIndex];
-  const dx = hole.holePos.x - ballPos.x;
-  const dz = hole.holePos.z - ballPos.z;
-  shotDirection = Math.atan2(dx, -dz);
+  aimAtGreen();
 }
 
 // ===== ボール停止時のカップ確認（転がって止まった場合）=====
@@ -1176,9 +1532,10 @@ function gameLoop(now) {
   if (!cupInProgress) {
     updateArrow();
     updateCamera();
+    updateFlagVisibility();
     if ((hudTick++ & 3) === 0) updateHUD();
   }
-  if (flagMesh && !cupInProgress) flagMesh.rotation.y += 0.01 * dt;
+  if (flagMesh && flagMesh.visible) flagMesh.rotation.y += 0.01 * dt;
   renderer.render(scene, camera);
 }
 

@@ -95,6 +95,10 @@
   </div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-  <script src="js/game.js"></script>
+  <?php
+  $_gjs = __DIR__ . DIRECTORY_SEPARATOR . 'js' . DIRECTORY_SEPARATOR . 'game.js';
+  $gameJsVer = is_readable($_gjs) ? ((int) filemtime($_gjs) . '-' . (int) filesize($_gjs)) : '0';
+  ?>
+  <script src="js/game.js?v=<?= htmlspecialchars($gameJsVer, ENT_QUOTES, 'UTF-8') ?>"></script>
 </body>
 </html>
