@@ -450,6 +450,21 @@ body {
   animation: shot-pop 1.4s ease-out forwards;
 }
 
+/* ===== カップイン（暗くしない） ===== */
+#cup-in-effect {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 50;
+}
+
+#game-screen.cup-in-active #hud,
+#game-screen.cup-in-active #controls {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.4s ease;
+}
+
 /* ===== リザルト ===== */
 #result-overlay {
   position: absolute;

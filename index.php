@@ -72,6 +72,10 @@
     </div>
 
     <div id="shot-effect"></div>
+
+    <div id="cup-in-effect" class="hidden">
+      <div id="cup-in-vignette"></div>
+    </div>
     <div id="shot-distance" class="hidden">
       <div id="shot-dist-label">飛距離</div>
       <div id="shot-dist-value">--</div>

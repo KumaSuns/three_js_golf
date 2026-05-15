@@ -35,11 +35,14 @@ const POWER_SPEED   = 1.5; // フレームごとのバー増減幅（往復）
 const RETURN_SPEED  = 1.35; // ③ フェーズでの戻り速度（インパクト猶予を確保）
 
 // コース単位 ≒ m（状態変数より前に定義すること）
-const BALL_RADIUS         = 0.021;
-// カップはボール実寸比では見えず入らないため、コース用のゲームスケールで表示・判定
-const CUP_RADIUS          = 0.5;
-const CUP_DEPTH           = 0.25;
-const CUP_CAPTURE_RADIUS  = CUP_RADIUS * 0.9;
+const BALL_RADIUS          = 0.084;  // ミニゲーム用（実寸の約4倍・視認性確保）
+const CUP_TO_BALL_RATIO    = 2.53;   // カップ半径 / ボール半径（実物比 ≒ 2.53）
+const CUP_RADIUS           = BALL_RADIUS * CUP_TO_BALL_RATIO;
+const CUP_SOIL_DEPTH       = 0.048;
+const CUP_LINER_DEPTH      = BALL_RADIUS * 4.2;
+const CUP_LINER_RADIUS     = CUP_RADIUS * 0.86;
+const CUP_TOTAL_DEPTH      = CUP_SOIL_DEPTH + CUP_LINER_DEPTH;
+const CUP_CAPTURE_RADIUS   = CUP_RADIUS * 0.92;
 const PLAYER_HEIGHT       = 1.65;
 const PLAYER_HEADS        = 5;
 const PLAYER_MODEL_HEAD_R = 0.21;
@@ -54,6 +57,24 @@ let shotDirection  = 0;
 let strokeCount    = 0;
 let currentHoleIndex = 0;
 let animId         = null;
+let lastFrameMs    = 0;
+let threeReady     = false;
+let hudTick        = 0;
+
+// 共有マテリアル（ホール切替のたびに new しない）
+const MAT = {};
+function initSharedMaterials() {
+  if (MAT.fairway) return;
+  MAT.fairway = new THREE.MeshLambertMaterial({ color: 0x3a9a4a });
+  MAT.green   = new THREE.MeshLambertMaterial({ color: 0x55dd55 });
+  MAT.rough   = new THREE.MeshLambertMaterial({ color: 0x2d7a35 });
+  MAT.bunker  = new THREE.MeshLambertMaterial({ color: 0xe8d5a3 });
+  MAT.trunk   = new THREE.MeshLambertMaterial({ color: 0x7b4f2e });
+  MAT.leaves  = new THREE.MeshLambertMaterial({ color: 0x1e6e2e });
+  MAT.ball    = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  MAT.soil    = new THREE.MeshLambertMaterial({ color: 0x6b5340, side: THREE.DoubleSide });
+  MAT.cloud   = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 });
+}
 let courseMeshes   = [];
 let cameraAngleV   = 0.3;
 let cameraDistance = 18;
@@ -65,7 +86,19 @@ let lockedPower = 0;   // ② 確定したパワー値
 
 let cupInProgress   = false;
 let cupInTimer      = 0;
-const CUP_IN_FRAMES = 50;
+const CUP_IN_ROLL_FRAMES    = 22;
+const CUP_IN_DROP_FRAMES    = 18;
+const CUP_IN_SETTLE_FRAMES  = 10;
+const CUP_IN_CAM_FRAMES     = 24;
+const CUP_IN_TOTAL_FRAMES   = CUP_IN_ROLL_FRAMES + CUP_IN_DROP_FRAMES + CUP_IN_SETTLE_FRAMES;
+const FOG_NEAR_DEFAULT    = 60;
+const FOG_FAR_DEFAULT     = 200;
+let cupCamFromPos    = null;
+let cupCamToPos      = null;
+let cupCamFromTarget = null;
+let cupCamToTarget   = null;
+let ballCupStart     = { x: 0, y: 0, z: 0 };
+let holeGreenMesh    = null;
 
 let shotStartPos        = { x: 0, z: 0 };
 let showingDistance     = false;
@@ -137,12 +170,18 @@ startBtn.addEventListener('click', () => {
 
 // ===== Three.js 初期化 =====
 function initThree() {
+  if (threeReady) return;
+  threeReady = true;
+  initSharedMaterials();
+
   const canvas = document.getElementById('game-canvas');
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer = new THREE.WebGLRenderer({
+    canvas,
+    antialias: false,
+    powerPreference: 'high-performance',
+  });
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(window.devicePixelRatio);
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x87ceeb);
@@ -150,23 +189,11 @@ function initThree() {
 
   camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 500);
 
-  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  scene.add(new THREE.HemisphereLight(0x87ceeb, 0x3a9a4a, 0.35));
 
-  // プレイヤーを引き立てるフィルライト（前方・やや青）
-  const fillLight = new THREE.DirectionalLight(0xaaccff, 0.45);
-  fillLight.position.set(-15, 10, 25);
-  scene.add(fillLight);
-
-  const sun = new THREE.DirectionalLight(0xfff8e7, 1.2);
+  const sun = new THREE.DirectionalLight(0xfff8e7, 1.0);
   sun.position.set(30, 60, 30);
-  sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.near   =   0.5;
-  sun.shadow.camera.far    = 300;
-  sun.shadow.camera.left   = -100;
-  sun.shadow.camera.right  =  100;
-  sun.shadow.camera.top    =  100;
-  sun.shadow.camera.bottom = -100;
   scene.add(sun);
 
   addClouds();
@@ -175,16 +202,16 @@ function initThree() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
   });
 }
 
 // ===== 雲 =====
 function addClouds() {
-  const mat = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 });
   [[-30,25,-60],[20,28,-80],[-50,22,-50],[40,30,-100],[0,26,-120]].forEach(([x,y,z]) => {
     const g = new THREE.Group();
     [[0,0,0,4],[-4,-1,0,3],[4,-1,0,3],[0,-1,-3,2.5]].forEach(([cx,cy,cz,r]) => {
-      const m = new THREE.Mesh(new THREE.SphereGeometry(r,7,7), mat);
+      const m = new THREE.Mesh(new THREE.SphereGeometry(r, 5, 5), MAT.cloud);
       m.position.set(cx,cy,cz);
       g.add(m);
     });
@@ -200,6 +227,9 @@ function loadHole(idx) {
   ballInFlight    = false;
   cupInProgress   = false;
   cupInTimer      = 0;
+  hideCupInEffect();
+  if (playerGroup) playerGroup.visible = true;
+  gameScreen.classList.remove('cup-in-active');
   shotDirection   = 0;
   cameraAngleV    = 0.3;
   shotStartPos    = { x: 0, z: 0 };
@@ -213,6 +243,7 @@ function loadHole(idx) {
   if (holeMesh)  scene.remove(holeMesh);
   if (flagMesh)  scene.remove(flagMesh);
   if (arrowMesh) scene.remove(arrowMesh);
+  holeGreenMesh = null;
 
   const hole = HOLES[idx];
   holeNumEl.textContent = hole.name;
@@ -228,38 +259,31 @@ function loadHole(idx) {
   updateHUD();
   updateShotUI();
 
-  if (animId) cancelAnimationFrame(animId);
-  gameLoop();
+  lastFrameMs = 0;
+  if (!animId) gameLoop(performance.now());
 }
 
 // ===== コース生成 =====
 function buildCourse(hole) {
   const W = 30, L = hole.terrain === 'hill' ? 180 : 130;
 
-  const fairway = new THREE.Mesh(
-    buildTerrainGeometry(W, L, hole.terrain),
-    new THREE.MeshLambertMaterial({ color: 0x3a9a4a })
-  );
-  fairway.receiveShadow = true;
+  const fairway = new THREE.Mesh(buildTerrainGeometry(W, L, hole.terrain), MAT.fairway);
   scene.add(fairway);
   courseMeshes.push(fairway);
 
   const green = new THREE.Mesh(
-    new THREE.CircleGeometry(7, 32),
-    new THREE.MeshLambertMaterial({ color: 0x55dd55 })
+    new THREE.RingGeometry(CUP_RADIUS * 1.06, 7, 32),
+    MAT.green
   );
   green.rotation.x = -Math.PI / 2;
-  green.position.set(hole.holePos.x, 0.01, hole.holePos.z);
+  green.position.set(hole.holePos.x, 0.011, hole.holePos.z);
   scene.add(green);
   courseMeshes.push(green);
+  holeGreenMesh = green;
 
-  const rough = new THREE.Mesh(
-    new THREE.PlaneGeometry(100, L + 40),
-    new THREE.MeshLambertMaterial({ color: 0x2d7a35 })
-  );
+  const rough = new THREE.Mesh(new THREE.PlaneGeometry(100, L + 40), MAT.rough);
   rough.rotation.x = -Math.PI / 2;
   rough.position.set(0, -0.02, (hole.ballStart.z + hole.holePos.z) / 2);
-  rough.receiveShadow = true;
   scene.add(rough);
   courseMeshes.push(rough);
 
@@ -268,7 +292,7 @@ function buildCourse(hole) {
 }
 
 function buildTerrainGeometry(W, L, type) {
-  const geo = new THREE.PlaneGeometry(W, L, 20, 40);
+  const geo = new THREE.PlaneGeometry(W, L, 12, 24);
   geo.rotateX(-Math.PI / 2);
   if (type === 'slope') {
     const pos = geo.attributes.position;
@@ -288,10 +312,7 @@ function buildTerrainGeometry(W, L, type) {
 function addBunkers(hole) {
   const mid = (hole.ballStart.z + hole.holePos.z) / 2;
   [[8, mid - 10], [-8, mid + 10]].forEach(([x, z]) => {
-    const mesh = new THREE.Mesh(
-      new THREE.CircleGeometry(1, 16),
-      new THREE.MeshLambertMaterial({ color: 0xe8d5a3 })
-    );
+    const mesh = new THREE.Mesh(new THREE.CircleGeometry(1, 12), MAT.bunker);
     mesh.scale.set(4, 3, 1);
     mesh.rotation.x = -Math.PI / 2;
     mesh.position.set(x, 0.02, z);
@@ -303,21 +324,13 @@ function addBunkers(hole) {
 function addTrees(hole) {
   const mid = (hole.ballStart.z + hole.holePos.z) / 2;
   [[16,mid-20],[-16,mid-10],[17,mid+15],[-17,mid+5],[15,mid-35],[-15,mid+30]].forEach(([x,z]) => {
-    const trunk = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.3, 0.5, 3, 7),
-      new THREE.MeshLambertMaterial({ color: 0x7b4f2e })
-    );
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.5, 3, 6), MAT.trunk);
     trunk.position.set(x, 1.5, z);
-    trunk.castShadow = true;
     scene.add(trunk);
     courseMeshes.push(trunk);
 
-    const leaves = new THREE.Mesh(
-      new THREE.ConeGeometry(2.5, 5, 8),
-      new THREE.MeshLambertMaterial({ color: 0x1e6e2e })
-    );
+    const leaves = new THREE.Mesh(new THREE.ConeGeometry(2.5, 5, 6), MAT.leaves);
     leaves.position.set(x, 6, z);
-    leaves.castShadow = true;
     scene.add(leaves);
     courseMeshes.push(leaves);
   });
@@ -325,11 +338,7 @@ function addTrees(hole) {
 
 // ===== ボール配置 =====
 function placeBall(x, z) {
-  ball = new THREE.Mesh(
-    new THREE.SphereGeometry(BALL_RADIUS, 16, 16),
-    new THREE.MeshLambertMaterial({ color: 0xffffff })
-  );
-  ball.castShadow = true;
+  ball = new THREE.Mesh(new THREE.SphereGeometry(BALL_RADIUS, 12, 12), MAT.ball);
   ball.visible = true;
   ball.scale.setScalar(1);
   ballPos = { x, y: BALL_RADIUS, z };
@@ -338,23 +347,51 @@ function placeBall(x, z) {
 }
 
 // ===== ホール＆フラッグ =====
+// 構造: 芝生面 → 土壁（暗） → 白いプラスチックライナー（沈み込み）
 function placeHole(x, z) {
   holeMesh = new THREE.Group();
 
-  const cup = new THREE.Mesh(
-    new THREE.CylinderGeometry(CUP_RADIUS, CUP_RADIUS, CUP_DEPTH, 24),
+  const soil = new THREE.Mesh(
+    new THREE.CylinderGeometry(CUP_RADIUS, CUP_RADIUS * 1.03, CUP_SOIL_DEPTH, 16, 1, true),
+    MAT.soil
+  );
+  soil.position.y = -CUP_SOIL_DEPTH / 2;
+  holeMesh.add(soil);
+
+  const linerMat = new THREE.MeshLambertMaterial({
+    color: 0xd8d8d0,
+    side: THREE.DoubleSide,
+  });
+  const liner = new THREE.Mesh(
+    new THREE.CylinderGeometry(CUP_LINER_RADIUS, CUP_LINER_RADIUS * 0.97, CUP_LINER_DEPTH, 16, 1, true),
+    linerMat
+  );
+  liner.position.y = -CUP_SOIL_DEPTH - CUP_LINER_DEPTH / 2;
+  holeMesh.add(liner);
+
+  const linerBottom = new THREE.Mesh(
+    new THREE.CircleGeometry(CUP_LINER_RADIUS * 0.97, 16),
+    new THREE.MeshLambertMaterial({ color: 0xcccccc })
+  );
+  linerBottom.rotation.x = -Math.PI / 2;
+  linerBottom.position.y = -CUP_TOTAL_DEPTH + 0.006;
+  holeMesh.add(linerBottom);
+
+  const drain = new THREE.Mesh(
+    new THREE.CircleGeometry(CUP_LINER_RADIUS * 0.12, 12),
     new THREE.MeshLambertMaterial({ color: 0x111111 })
   );
-  cup.position.y = -CUP_DEPTH / 2;
-  holeMesh.add(cup);
+  drain.rotation.x = -Math.PI / 2;
+  drain.position.y = -CUP_TOTAL_DEPTH + 0.007;
+  holeMesh.add(drain);
 
-  const rim = new THREE.Mesh(
-    new THREE.TorusGeometry(CUP_RADIUS, 0.035, 8, 24),
-    new THREE.MeshLambertMaterial({ color: 0xffffff })
+  const grassLip = new THREE.Mesh(
+    new THREE.TorusGeometry(CUP_RADIUS, CUP_RADIUS * 0.04, 8, 24),
+    new THREE.MeshLambertMaterial({ color: 0x4ccc4c })
   );
-  rim.rotation.x = Math.PI / 2;
-  rim.position.y = 0.01;
-  holeMesh.add(rim);
+  grassLip.rotation.x = Math.PI / 2;
+  grassLip.position.y = 0.003;
+  holeMesh.add(grassLip);
 
   holeMesh.position.set(x, 0, z);
   scene.add(holeMesh);
@@ -403,19 +440,18 @@ function buildPlayer() {
   swingAngle = swingTarget = SWING_ADDR;
   playerGroup = new THREE.Group();
 
-  const mSkin  = new THREE.MeshPhongMaterial({ color: 0xffbb88, shininess: 30 });
-  const mShirt = new THREE.MeshPhongMaterial({ color: 0x1155ee, shininess: 25 });
-  const mPants = new THREE.MeshPhongMaterial({ color: 0x1a2a44, shininess: 15 });
-  const mShoe  = new THREE.MeshPhongMaterial({ color: 0x221100, shininess: 50 });
-  const mCap   = new THREE.MeshPhongMaterial({ color: 0xdd2200, shininess: 20 });
-  const mGlove = new THREE.MeshPhongMaterial({ color: 0xf0f0f0, shininess: 40 });
-  const mShaft = new THREE.MeshPhongMaterial({ color: 0xc0c0c0, shininess: 120 });
-  const mClub  = new THREE.MeshPhongMaterial({ color: 0x777777, shininess: 100 });
+  const mSkin  = new THREE.MeshLambertMaterial({ color: 0xffbb88 });
+  const mShirt = new THREE.MeshLambertMaterial({ color: 0x1155ee });
+  const mPants = new THREE.MeshLambertMaterial({ color: 0x1a2a44 });
+  const mShoe  = new THREE.MeshLambertMaterial({ color: 0x221100 });
+  const mCap   = new THREE.MeshLambertMaterial({ color: 0xdd2200 });
+  const mGlove = new THREE.MeshLambertMaterial({ color: 0xf0f0f0 });
+  const mShaft = new THREE.MeshLambertMaterial({ color: 0xc0c0c0 });
+  const mClub  = new THREE.MeshLambertMaterial({ color: 0x777777 });
 
   function mk(geo, mat, px, py, pz) {
     const m = new THREE.Mesh(geo, mat);
     m.position.set(px || 0, py || 0, pz || 0);
-    m.castShadow = true;
     return m;
   }
   const B = (w,h,d) => new THREE.BoxGeometry(w, h, d);
@@ -501,7 +537,7 @@ function updatePlayerTransform() {
   playerGroup.rotation.y = Math.atan2(dx, -dz) + Math.PI;
 }
 
-function updatePlayer() {
+function updatePlayer(dt) {
   if (!playerGroup) return;
 
   if (!ballInFlight && (shotState === SHOT_IDLE || shotState === SHOT_POWER)) {
@@ -524,7 +560,7 @@ function updatePlayer() {
 
   if (ballInFlight) swingTarget = SWING_THRU;
 
-  swingAngle += (swingTarget - swingAngle) * (ballInFlight ? 0.04 : 0.16);
+  swingAngle += (swingTarget - swingAngle) * (ballInFlight ? 0.04 : 0.16) * dt;
   if (playerParts.armsGrp) playerParts.armsGrp.rotation.x = swingAngle;
 
   if (shotState === SHOT_IDLE && !ballInFlight) {
@@ -780,9 +816,9 @@ function fireShot(impactValue) {
 }
 
 // ===== フレームごとのバー更新 =====
-function updateShotMeters() {
+function updateShotMeters(dt) {
   if (shotState === SHOT_POWER) {
-    power += powerDir * POWER_SPEED;
+    power += powerDir * POWER_SPEED * dt;
     if (isPutterClub()) {
       if (power >= 100) { power = 100; powerDir = -1; }
       if (power <= 0)   { power = 0;   powerDir =  1; }
@@ -796,7 +832,7 @@ function updateShotMeters() {
 
   if (shotState === SHOT_SWING && !isPutterClub()) {
     // パワー確定後、100%まで振り切る
-    power += POWER_SPEED * 1.5;
+    power += POWER_SPEED * 1.5 * dt;
     if (power >= 100) {
       power     = 100;
       shotState = SHOT_RETURN;
@@ -807,7 +843,7 @@ function updateShotMeters() {
   }
 
   if (shotState === SHOT_RETURN && !isPutterClub()) {
-    power -= RETURN_SPEED;
+    power -= RETURN_SPEED * dt;
     if (power <= 0) {
       power = 0;
       if (!impactQueued) {
@@ -843,45 +879,181 @@ function checkPoleCollision() {
   }
 }
 
-// ===== カップイン演出 =====
+// ===== カップイン演出（寄りカメラ・ボール沈み） =====
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+function easeInQuad(t) {
+  return t * t;
+}
+
+function lerpVal(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function getBallSurfaceY(x, z) {
+  return getGroundY(z) + BALL_RADIUS;
+}
+
+function getCupLinerTopY() {
+  const hole = HOLES[currentHoleIndex];
+  return getGroundY(hole.holePos.z) - CUP_SOIL_DEPTH;
+}
+
+function getCupBottomY() {
+  const hole = HOLES[currentHoleIndex];
+  return getGroundY(hole.holePos.z) - CUP_TOTAL_DEPTH + BALL_RADIUS;
+}
+
+function cupMouthRadius() {
+  return Math.max(BALL_RADIUS * 0.5, CUP_RADIUS - BALL_RADIUS * 0.9);
+}
+
+function setupCupInCamera() {
+  const hole = HOLES[currentHoleIndex];
+  const hx = hole.holePos.x;
+  const hz = hole.holePos.z;
+
+  if (!cupCamFromPos) {
+    cupCamFromPos    = new THREE.Vector3();
+    cupCamToPos      = new THREE.Vector3();
+    cupCamFromTarget = new THREE.Vector3();
+    cupCamToTarget   = new THREE.Vector3();
+  }
+
+  cupCamFromPos.copy(camera.position);
+  const lookDir = new THREE.Vector3();
+  camera.getWorldDirection(lookDir);
+  cupCamFromTarget.copy(camera.position).add(lookDir.multiplyScalar(12));
+
+  // 斜め前方 — カップ縁とボールが見える高さ（穴の底は見ない）
+  const groundY = getGroundY(hz);
+  const camHoriz = CUP_RADIUS * 3.2;
+  const camHeight = CUP_RADIUS * 2.2;
+  cupCamToPos.set(hx + camHoriz * 0.65, camHeight, hz + camHoriz * 0.85);
+  cupCamToTarget.set(hx, groundY + BALL_RADIUS * 0.4, hz);
+}
+
+function updateCupInCamera(t, lookAtY) {
+  const e = easeInOutCubic(Math.min(1, Math.max(0, t)));
+  camera.position.lerpVectors(cupCamFromPos, cupCamToPos, e);
+  const look = new THREE.Vector3().lerpVectors(cupCamFromTarget, cupCamToTarget, e);
+  if (lookAtY !== undefined) look.y = lookAtY;
+  camera.lookAt(look);
+}
+
+function showCupInEffect() {
+  gameScreen.classList.add('cup-in-active');
+}
+
+function hideCupInEffect() {
+  gameScreen.classList.remove('cup-in-active');
+}
+
 function startCupIn() {
   if (cupInProgress) return;
   cupInProgress = true;
   cupInTimer    = 0;
   ballInFlight  = false;
   ballVel       = { x: 0, y: 0, z: 0 };
+  ballCupStart  = { x: ballPos.x, y: ballPos.y, z: ballPos.z };
+  if (playerGroup) playerGroup.visible = false;
+  if (arrowMesh) arrowMesh.visible = false;
+  ball.visible = true;
+  ball.scale.setScalar(1);
+  setupCupInCamera();
+  showCupInEffect();
 }
 
-function updateCupIn() {
+function updateCupIn(dt) {
   const hole = HOLES[currentHoleIndex];
-  cupInTimer++;
-  const t = Math.min(cupInTimer / CUP_IN_FRAMES, 1);
+  const hx = hole.holePos.x;
+  const hz = hole.holePos.z;
+  cupInTimer += dt;
 
-  // カップ中心へ引き寄せ
-  ballPos.x += (hole.holePos.x - ballPos.x) * 0.18;
-  ballPos.z += (hole.holePos.z - ballPos.z) * 0.18;
-  // 沈む
-  ballPos.y = BALL_RADIUS * (1 - t) - CUP_DEPTH * 0.5 * t;
-  // 縮む
-  ball.scale.setScalar(Math.max(0.01, 1 - t));
+  const mouthR     = cupMouthRadius();
+  const lipDist    = CUP_RADIUS + BALL_RADIUS * 0.35;
+  const linerEntryY = getCupLinerTopY() + BALL_RADIUS;
+  const bottomY     = getCupBottomY();
+  const startDx = ballCupStart.x - hx;
+  const startDz = ballCupStart.z - hz;
+  const startDist = Math.hypot(startDx, startDz);
+  const lipX = hx + (startDist > 0.001 ? (startDx / startDist) * lipDist : 0);
+  const lipZ = hz + (startDist > 0.001 ? (startDz / startDist) * lipDist : 0);
+  const restX = hx + CUP_LINER_RADIUS * 0.22;
+  const restZ = hz - CUP_LINER_RADIUS * 0.16;
+
+  const rollEnd   = CUP_IN_ROLL_FRAMES;
+  const dropEnd   = rollEnd + CUP_IN_DROP_FRAMES;
+  const settleEnd = dropEnd + CUP_IN_SETTLE_FRAMES;
+
+  if (cupInTimer <= rollEnd) {
+    const t = easeInOutCubic(cupInTimer / rollEnd);
+    ballPos.x = lerpVal(ballCupStart.x, lipX, t);
+    ballPos.z = lerpVal(ballCupStart.z, lipZ, t);
+    const surfaceY = getBallSurfaceY(ballPos.x, ballPos.z);
+    ballPos.y = lerpVal(Math.max(ballCupStart.y, surfaceY), surfaceY, t);
+    ball.rotation.x += 0.12 * (startDist / Math.max(lipDist, 0.01)) * dt;
+  } else if (cupInTimer <= dropEnd) {
+    const t = (cupInTimer - rollEnd) / CUP_IN_DROP_FRAMES;
+    const horizT = easeInOutCubic(Math.min(1, t / 0.5));
+    ballPos.x = lerpVal(lipX, hx, horizT);
+    ballPos.z = lerpVal(lipZ, hz, horizT);
+
+    const dist = Math.hypot(ballPos.x - hx, ballPos.z - hz);
+    const rimY = getBallSurfaceY(ballPos.x, ballPos.z);
+
+    if (dist > mouthR || t < 0.35) {
+      ballPos.y = rimY;
+    } else if (t < 0.58) {
+      const soilT = easeInQuad((t - 0.35) / 0.23);
+      ballPos.y = lerpVal(rimY, linerEntryY, soilT);
+    } else {
+      const fallT = easeInQuad((t - 0.58) / 0.42);
+      ballPos.y = lerpVal(linerEntryY, bottomY, fallT);
+    }
+
+    if (t > 0.62) {
+      const slide = (t - 0.62) / 0.38;
+      ballPos.x = lerpVal(hx, restX, easeInOutCubic(slide));
+      ballPos.z = lerpVal(hz, restZ, easeInOutCubic(slide));
+    }
+  } else if (cupInTimer <= settleEnd) {
+    const t = (cupInTimer - dropEnd) / CUP_IN_SETTLE_FRAMES;
+    ballPos.x = restX;
+    ballPos.z = restZ;
+    ballPos.y = bottomY + Math.sin(t * Math.PI) * BALL_RADIUS * 0.2;
+  } else {
+    ballPos.x = restX;
+    ballPos.z = restZ;
+    ballPos.y = bottomY;
+  }
+
   ball.position.set(ballPos.x, ballPos.y, ballPos.z);
 
-  if (t >= 1) {
+  const tCam = Math.min(1, cupInTimer / CUP_IN_CAM_FRAMES);
+  const lookY = cupInTimer > CUP_IN_ROLL_FRAMES ? ballPos.y : undefined;
+  updateCupInCamera(tCam, lookY);
+
+  if (cupInTimer >= CUP_IN_TOTAL_FRAMES) {
     cupInProgress = false;
-    ball.visible  = false; // 完全に消す
+    ball.visible  = false;
+    if (arrowMesh) arrowMesh.visible = true;
+    hideCupInEffect();
     showResult();
   }
 }
 
 // ===== ボール物理 =====
-function updateBall() {
-  if (cupInProgress) { updateCupIn(); return; }
+function updateBall(dt) {
+  if (cupInProgress) { updateCupIn(dt); return; }
   if (!ballInFlight) return;
 
-  ballVel.y += GRAVITY;
-  ballPos.x += ballVel.x;
-  ballPos.y += ballVel.y;
-  ballPos.z += ballVel.z;
+  ballVel.y += GRAVITY * dt;
+  ballPos.x += ballVel.x * dt;
+  ballPos.y += ballVel.y * dt;
+  ballPos.z += ballVel.z * dt;
 
   // ポール当たり判定
   checkPoleCollision();
@@ -917,8 +1089,8 @@ function updateBall() {
   }
 
   ball.position.set(ballPos.x, ballPos.y, ballPos.z);
-  ball.rotation.x += ballVel.z * 5;
-  ball.rotation.z -= ballVel.x * 5;
+  ball.rotation.x += ballVel.z * 5 * dt;
+  ball.rotation.z -= ballVel.x * 5 * dt;
 }
 
 function getGroundY(z) {
@@ -989,18 +1161,24 @@ nextHoleBtn.addEventListener('click', () => {
   }
 });
 
-// ===== メインループ =====
-function gameLoop() {
+// ===== メインループ（dt=1 が 60fps 相当。fps が落ちても速度は一定） =====
+function gameLoop(now) {
   animId = requestAnimationFrame(gameLoop);
+  const dt = lastFrameMs
+    ? Math.min((now - lastFrameMs) / (1000 / 60), 1.35)
+    : 1;
+  lastFrameMs = now;
+
   processImpactInput();
-  updateShotMeters();
-  processImpactInput();
-  updateBall();
-  updatePlayer();
-  updateArrow();
-  updateCamera();
-  updateHUD();
-  if (flagMesh) flagMesh.rotation.y += 0.01;
+  updateShotMeters(dt);
+  updateBall(dt);
+  updatePlayer(dt);
+  if (!cupInProgress) {
+    updateArrow();
+    updateCamera();
+    if ((hudTick++ & 3) === 0) updateHUD();
+  }
+  if (flagMesh && !cupInProgress) flagMesh.rotation.y += 0.01 * dt;
   renderer.render(scene, camera);
 }
 
