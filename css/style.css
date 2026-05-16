@@ -553,6 +553,14 @@ body {
   letter-spacing: 4px;
 }
 
+.shot-lie {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: #9ef5c0;
+  letter-spacing: 0.2em;
+  text-shadow: 0 0 10px rgba(158, 245, 192, 0.45);
+}
+
 #shot-dist-buttons {
   display: flex;
   gap: 14px;

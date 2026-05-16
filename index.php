@@ -79,6 +79,7 @@
     <div id="shot-distance" class="hidden">
       <div id="shot-dist-label">飛距離</div>
       <div id="shot-dist-value">--</div>
+      <div id="shot-lie" class="shot-lie"></div>
       <div id="shot-dist-buttons">
         <button id="retry-btn">打ち直し</button>
         <button id="next-shot-btn">次のショットへ</button>

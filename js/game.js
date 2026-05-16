@@ -28,26 +28,47 @@ const SHOT_IDLE   = 0; // 待機
 const SHOT_POWER  = 1; // ① バー往復中（パワー選択）
 const SHOT_SWING  = 2; // ② パワー確定後、100%まで振り切る
 const SHOT_RETURN = 3; // ③ バー戻り中（インパクト待ち）
+const SHOT_DELAY_IMPACT = 4; // インパクト確定後〜ボール・スウィング開始までの待ち
+const SHOT_DOWN_SWING = 5; // トップからのダウンスウィング（この間にボールを出す）
 
 // インパクトゾーン（中心 ± IMPACT_HALF がエリア）
 const IMPACT_ZONE   = 15;  // 中心線の CSS 位置 (%)
 const IMPACT_HALF   = 10;  // エリア幅の半分 (%)  → エリア: 5%〜25%
 const POWER_SPEED   = 1.5; // フレームごとのバー増減幅（往復）
 const RETURN_SPEED  = 1.35; // ③ フェーズでの戻り速度（インパクト猶予を確保）
+/** インパクト決定からダウンスウィング開始までトップで止める時間（ms） */
+const IMPACT_TO_SWING_MS = 500;
+/** ダウンスウィング全体の時間（1秒少し。smoothstep で加減速） */
+const DOWN_SWING_MS = 1080;
+/** ダウンスウィング進行 0〜1 のうち、ここで fireShot（インパクト） */
+const DOWN_SWING_IMPACT_U = 0.4;
 
 // コース単位 ≒ m（状態変数より前に定義すること）
-const BALL_RADIUS          = 0.084;  // ミニゲーム用（実寸の約4倍・視認性確保）
-const CUP_TO_BALL_RATIO    = 2.53;   // カップ半径 / ボール半径（実物比 ≒ 2.53）
-const CUP_RADIUS           = BALL_RADIUS * CUP_TO_BALL_RATIO;
-const CUP_SOIL_DEPTH       = 0.048;
-const CUP_LINER_DEPTH      = BALL_RADIUS * 4.2;
-const CUP_LINER_RADIUS     = CUP_RADIUS * 0.86;
-const CUP_TOTAL_DEPTH      = CUP_SOIL_DEPTH + CUP_LINER_DEPTH;
-const CUP_CAPTURE_RADIUS   = CUP_RADIUS * 0.92;
-const GREEN_INNER_RADIUS   = CUP_RADIUS * 1.35; // カップ穴の外縁（グリーンリング内径）
-const GREEN_OUTER_RADIUS   = 7;                 // パッティンググリーン外周
-const PLAYER_HEIGHT       = 1.65;
-const PLAYER_HEADS        = 5;
+// ── ボール・カップ（実寸に近づける）: ホール径 108 mm、カップ深さ 100 mm 以上
+const CUP_DIAMETER_M = 0.108;
+const CUP_RADIUS = CUP_DIAMETER_M * 0.5;
+const CUP_TO_BALL_RATIO = 2.53; // カップ径 / 球径（実物に近い比）
+const BALL_RADIUS = CUP_RADIUS / CUP_TO_BALL_RATIO;
+const CUP_SOIL_DEPTH = 0.02; // 口縁〜ライナー上（目安 20 mm）
+const CUP_LINER_DEPTH = 0.09; // ライナー部（合計深さ >= 100 mm）
+const CUP_LINER_RADIUS = CUP_RADIUS * 0.86;
+const CUP_TOTAL_DEPTH = CUP_SOIL_DEPTH + CUP_LINER_DEPTH;
+const CUP_CAPTURE_RADIUS = CUP_RADIUS * 0.92;
+const GREEN_INNER_RADIUS = CUP_RADIUS * 1.35; // カップ穴の外縁（グリーンリング内径）
+const GREEN_OUTER_RADIUS = 7; // パッティンググリーン外周（プレイ用・実寸より広め）
+
+// フラッグポール全長 2.1〜2.4 m（中間）、旗面 340×500 mm（一般的サイズ）
+const FLAG_PIN_HEIGHT = 2.25;
+const FLAG_WIDTH = 0.34;
+const FLAG_HEIGHT = 0.5;
+const POLE_RADIUS = 0.006; // 竿径の目安 ≈ 12 mm
+/** XZ 当たり半径（幾何＋すり抜け防止のマージン） */
+const POLE_HITXZ_RADIUS = POLE_RADIUS + BALL_RADIUS + 0.012;
+const FLAG_LOCAL_X = POLE_RADIUS * 2.5 + FLAG_WIDTH * 0.5;
+const FLAG_LOCAL_Y = FLAG_PIN_HEIGHT - FLAG_HEIGHT * 0.48;
+
+const PLAYER_HEIGHT = 1.7; // 170 cm
+const PLAYER_HEADS = 5;
 const PLAYER_MODEL_HEAD_R = 0.21;
 
 // ===== 状態変数 =====
@@ -121,10 +142,6 @@ let holeGreenMesh    = null;
 const greenRaycaster = new THREE.Raycaster();
 const greenRayOrigin = new THREE.Vector3();
 const greenRayDir    = new THREE.Vector3(0, -1, 0);
-const FLAG_WIDTH     = 1.2;
-const FLAG_HEIGHT    = 0.8;
-const FLAG_LOCAL_X   = 0.6;
-const FLAG_LOCAL_Y   = 3.8;
 const _flagLocalBall = new THREE.Vector3();
 const _flagNormal    = new THREE.Vector3();
 const _flagWorldPos  = new THREE.Vector3();
@@ -139,6 +156,10 @@ const _clubQAlign     = new THREE.Quaternion();
 let showingDistance     = false;
 let preRetryStrokeCount = 0;
 let impactQueued        = false; // インパクト入力を次フレームで確実に処理
+let shotSwingDelayTimerId = null;
+let downSwingStartMs    = 0;
+let downSwingBallReleased = false;
+let downSwingImpactValue  = IMPACT_ZONE;
 
 // ===== プレイヤー =====
 let playerGroup  = null;
@@ -163,7 +184,6 @@ let swingTarget  = SWING_ADDR;
 const GRAVITY = -0.018;
 const FRICTION = 0.97;
 const BOUNCE   = 0.35;
-const POLE_RADIUS = 0.05; // ポール半径（m）
 // ショット後のボール・カップイン演出の時間倍率（小さいほどゆっくり）
 const BALL_FLIGHT_SCALE = 0.68;
 const SHOT_DISTANCE_DELAY_MS = 400;
@@ -198,6 +218,7 @@ const powerLabelSpans = document.querySelectorAll('#power-labels span');
 const shotEffectEl   = document.getElementById('shot-effect');
 const shotDistanceEl = document.getElementById('shot-distance');
 const shotDistValue  = document.getElementById('shot-dist-value');
+const shotLieEl      = document.getElementById('shot-lie');
 const retryBtn       = document.getElementById('retry-btn');
 const nextShotBtn    = document.getElementById('next-shot-btn');
 const resultOverlay  = document.getElementById('result-overlay');
@@ -528,10 +549,10 @@ function placeHole(x, z) {
 
   flagMesh = new THREE.Group();
   flagPolePart = new THREE.Mesh(
-    new THREE.CylinderGeometry(POLE_RADIUS, POLE_RADIUS, 4, 8),
+    new THREE.CylinderGeometry(POLE_RADIUS, POLE_RADIUS, FLAG_PIN_HEIGHT, 8),
     new THREE.MeshLambertMaterial({ color: 0xcccccc })
   );
-  flagPolePart.position.y = 2;
+  flagPolePart.position.y = FLAG_PIN_HEIGHT * 0.5;
   flagMesh.add(flagPolePart);
 
   flagClothPart = new THREE.Mesh(
@@ -744,7 +765,15 @@ function updateClubAddressOrientation() {
   const club = playerParts.clubGrp;
   if (!club || !playerGroup) return;
   if (ballInFlight || cupInProgress || showingDistance) return;
-  if (shotState !== SHOT_IDLE && shotState !== SHOT_POWER) return;
+  if (
+    shotState !== SHOT_IDLE &&
+    shotState !== SHOT_POWER &&
+    shotState !== SHOT_SWING &&
+    shotState !== SHOT_RETURN &&
+    shotState !== SHOT_DELAY_IMPACT
+  ) {
+    return;
+  }
 
   club.updateMatrixWorld(true);
   club.getWorldPosition(_clubHandW);
@@ -769,45 +798,77 @@ function updateClubAddressOrientation() {
 function updatePlayer(dt) {
   if (!playerGroup) return;
 
-  if (!ballInFlight && (shotState === SHOT_IDLE || shotState === SHOT_POWER)) {
-    updatePlayerTransform();
+  // 足元は打席中いつも更新（ダウンスウィング中もボール前で踏ん張る）
+  const onGroundShotMeter =
+    !ballInFlight &&
+    !cupInProgress &&
+    !showingDistance &&
+    (shotState === SHOT_IDLE ||
+      shotState === SHOT_POWER ||
+      shotState === SHOT_SWING ||
+      shotState === SHOT_RETURN ||
+      shotState === SHOT_DELAY_IMPACT ||
+      shotState === SHOT_DOWN_SWING);
+
+  if (onGroundShotMeter) updatePlayerTransform();
+
+  if (shotState === SHOT_SWING && !ballInFlight) {
+    const t = Math.min(1, (power - lockedPower) / Math.max(1, 100 - lockedPower));
+    swingTarget = SWING_ADDR + (SWING_BACK - SWING_ADDR) * t;
+    if (playerParts.bodyGrp) playerParts.bodyGrp.rotation.y = t * 0.4;
+  } else if (
+    (shotState === SHOT_RETURN || shotState === SHOT_DELAY_IMPACT) &&
+    !ballInFlight
+  ) {
+    swingTarget = SWING_BACK;
+    if (playerParts.bodyGrp) playerParts.bodyGrp.rotation.y = 0.4;
+  } else if (shotState === SHOT_DOWN_SWING && !ballInFlight) {
+    const elapsed = performance.now() - downSwingStartMs;
+    const u = Math.min(1, elapsed / DOWN_SWING_MS);
+    const e = u * u * (3 - 2 * u);
+    swingTarget = SWING_BACK + (SWING_THRU - SWING_BACK) * e;
+    if (playerParts.bodyGrp) playerParts.bodyGrp.rotation.y = 0.4 * (1 - e);
+    if (!downSwingBallReleased && u >= DOWN_SWING_IMPACT_U) {
+      downSwingBallReleased = true;
+      fireShot(downSwingImpactValue);
+      if (ballInFlight) shotState = SHOT_IDLE;
+    }
+    if (downSwingBallReleased && !ballInFlight && u >= 1) shotState = SHOT_IDLE;
+  } else if (!ballInFlight && (shotState === SHOT_IDLE || shotState === SHOT_POWER)) {
     swingTarget = SWING_ADDR;
     if (playerParts.bodyGrp) playerParts.bodyGrp.rotation.y = 0;
-  } else {
+  } else if (!onGroundShotMeter && !ballInFlight) {
     if (playerParts.lArmGrp) playerParts.lArmGrp.rotation.y = 0;
     if (playerParts.rArmGrp) playerParts.rArmGrp.rotation.y = 0;
   }
 
-  if (shotState === SHOT_SWING) {
-    const t = Math.min(1, (power - lockedPower) / Math.max(1, 100 - lockedPower));
-    swingTarget = SWING_ADDR + (SWING_BACK - SWING_ADDR) * t;
-    if (playerParts.bodyGrp) playerParts.bodyGrp.rotation.y = t * 0.4;
-  }
-
-  if (shotState === SHOT_RETURN) {
-    const t = 1 - power / 100;
-    swingTarget = SWING_BACK + (SWING_THRU - SWING_BACK) * t;
-    if (playerParts.bodyGrp) playerParts.bodyGrp.rotation.y = (1 - t) * 0.4;
-  }
-
   if (ballInFlight) swingTarget = SWING_THRU;
 
-  const atAddressReady =
+  if (
     !ballInFlight &&
     !cupInProgress &&
     !showingDistance &&
-    (shotState === SHOT_IDLE || shotState === SHOT_POWER);
-  if (atAddressReady) {
+    (shotState === SHOT_IDLE || shotState === SHOT_POWER)
+  ) {
     swingAngle = SWING_ADDR;
     swingTarget = SWING_ADDR;
   }
 
-  swingAngle += (swingTarget - swingAngle) * (ballInFlight ? 0.04 : 0.16) * dt;
+  const downSwingDriving = shotState === SHOT_DOWN_SWING && !ballInFlight;
+  if (!downSwingDriving) {
+    swingAngle += (swingTarget - swingAngle) * (ballInFlight ? 0.04 : 0.16) * dt;
+  } else {
+    swingAngle = swingTarget;
+  }
   if (playerParts.armsGrp) playerParts.armsGrp.rotation.x = swingAngle;
 
   if (
     !ballInFlight &&
-    (shotState === SHOT_IDLE || shotState === SHOT_POWER) &&
+    (shotState === SHOT_IDLE ||
+      shotState === SHOT_POWER ||
+      shotState === SHOT_SWING ||
+      shotState === SHOT_RETURN ||
+      shotState === SHOT_DELAY_IMPACT) &&
     !cupInProgress &&
     !showingDistance
   ) {
@@ -899,15 +960,19 @@ function isPutterClub() {
   return CLUBS[currentClub].name === 'PT';
 }
 
-function isBallOnGreen() {
-  if (!holeGreenMesh || ballInFlight) return false;
-
-  greenRayOrigin.set(ballPos.x, ballPos.y + 0.5, ballPos.z);
+/** グリーンリング面の直上付近か（飛行中判定は呼び出し側） */
+function isPointOnGreenSurface(px, py, pz) {
+  if (!holeGreenMesh) return false;
+  greenRayOrigin.set(px, py + 0.5, pz);
   greenRaycaster.set(greenRayOrigin, greenRayDir);
   const hit = greenRaycaster.intersectObject(holeGreenMesh, false)[0];
   if (!hit) return false;
-  // ボールの真下近くでグリーン面に当たっている＝グリーン上
-  return hit.distance <= ballPos.y + 0.12;
+  return hit.distance <= py + 0.12;
+}
+
+function isBallOnGreen() {
+  if (!holeGreenMesh || ballInFlight) return false;
+  return isPointOnGreenSurface(ballPos.x, ballPos.y, ballPos.z);
 }
 
 function updateFlagVisibility() {
@@ -929,10 +994,20 @@ function updateShotUI() {
   }
 }
 
+function cancelShotSwingDelay() {
+  if (shotSwingDelayTimerId !== null) {
+    clearTimeout(shotSwingDelayTimerId);
+    shotSwingDelayTimerId = null;
+  }
+}
+
 // ===== ショット状態リセット =====
 function resetShotState() {
+  cancelShotSwingDelay();
   shotState    = SHOT_IDLE;
   impactQueued = false;
+  downSwingBallReleased = false;
+  downSwingStartMs = 0;
   power       = 0;
   powerDir    = 1;
   lockedPower = 0;
@@ -946,8 +1021,19 @@ function resetShotState() {
 function processImpactInput() {
   if (!impactQueued || shotState !== SHOT_RETURN || ballInFlight) return;
   impactQueued = false;
-  shotState = SHOT_IDLE;
-  fireShot(power);
+  const impactValue = power;
+  impactZoneEl.classList.remove('active');
+  cancelShotSwingDelay();
+  shotState = SHOT_DELAY_IMPACT;
+  powerPhaseLabel.textContent = 'ショット';
+  shotSwingDelayTimerId = setTimeout(() => {
+    shotSwingDelayTimerId = null;
+    if (ballInFlight || shotState !== SHOT_DELAY_IMPACT) return;
+    shotState = SHOT_DOWN_SWING;
+    downSwingStartMs = performance.now();
+    downSwingBallReleased = false;
+    downSwingImpactValue = impactValue;
+  }, IMPACT_TO_SWING_MS);
 }
 
 function queueImpact() {
@@ -1027,6 +1113,10 @@ function showShotDistance() {
     ? Math.round(distUnits) + 'm'
     : Math.round(distUnits * 1.3) + 'yd';
   shotDistValue.textContent = distText;
+  if (shotLieEl) {
+    const lie = classifyBallLie();
+    shotLieEl.textContent = '停止位置: ' + lieLabelJa(lie);
+  }
   shotDistanceEl.classList.remove('hidden');
   showingDistance = true;
 }
@@ -1167,7 +1257,7 @@ function isNearCupForFlagHit() {
 }
 
 function checkPoleCollision() {
-  if (!flagMesh || !flagMesh.visible || isNearCupForFlagHit()) return;
+  if (!flagMesh || cupInProgress) return;
 
   const px = flagMesh.position.x;
   const pz = flagMesh.position.z;
@@ -1176,8 +1266,17 @@ function checkPoleCollision() {
   const distXZ = Math.hypot(dx, dz);
   if (distXZ < 1e-6) return;
 
-  const threshold = POLE_RADIUS + BALL_RADIUS;
-  if (distXZ < threshold && ballPos.y > 0 && ballPos.y < 4.5) {
+  // カップ口の真下付近だけポールを無効化（カップイン処理と競合しないように）
+  if (isNearCupForFlagHit() && distXZ < CUP_RADIUS * 0.75) return;
+
+  const poleBaseY = flagMesh.position.y;
+  const poleTopY = poleBaseY + FLAG_PIN_HEIGHT + BALL_RADIUS;
+  const threshold = POLE_HITXZ_RADIUS;
+  if (
+    distXZ < threshold &&
+    ballPos.y >= poleBaseY - BALL_RADIUS * 2 &&
+    ballPos.y <= poleTopY
+  ) {
     const nx = dx / distXZ;
     const nz = dz / distXZ;
     const dot = ballVel.x * nx + ballVel.z * nz;
@@ -1185,8 +1284,8 @@ function checkPoleCollision() {
       ballVel.x = (ballVel.x - 2 * dot * nx) * 0.55;
       ballVel.z = (ballVel.z - 2 * dot * nz) * 0.55;
     }
-    ballPos.x = px + nx * (threshold + 0.02);
-    ballPos.z = pz + nz * (threshold + 0.02);
+    ballPos.x = px + nx * (threshold + 0.015);
+    ballPos.z = pz + nz * (threshold + 0.015);
   }
 }
 
@@ -1459,6 +1558,57 @@ function getGroundY(z) {
   return 0;
 }
 
+/** buildCourse のフェアウェイと同じ半長（PlaneGeometry の Z 半分） */
+function getFairwayHalfExtents(hole) {
+  const halfW = 15;
+  const halfL = hole.terrain === 'hill' ? 90 : 65;
+  return { halfW, halfL };
+}
+
+/** buildCourse / addBunkers と同じ楕円バンカー内か */
+function isPointInBunker(px, pz, hole) {
+  const mid = (hole.ballStart.z + hole.holePos.z) * 0.5;
+  const radX = 4;
+  const radZ = 3;
+  const centers = [
+    [8, mid - 10],
+    [-8, mid + 10],
+  ];
+  for (let i = 0; i < centers.length; i++) {
+    const cx = centers[i][0];
+    const cz = centers[i][1];
+    const dx = (px - cx) / radX;
+    const dz = (pz - cz) / radZ;
+    if (dx * dx + dz * dz <= 1.002) return true;
+  }
+  return false;
+}
+
+function isPointInFairway(px, pz, hole) {
+  const { halfW, halfL } = getFairwayHalfExtents(hole);
+  return Math.abs(px) <= halfW && pz >= -halfL && pz <= halfL;
+}
+
+/** ボール停止位置: バンカー → グリーン → フェアウェイ → ラフ（優先順） */
+function classifyBallLie() {
+  const hole = HOLES[currentHoleIndex];
+  const bx = ballPos.x;
+  const by = ballPos.y;
+  const bz = ballPos.z;
+  if (isPointInBunker(bx, bz, hole)) return 'bunker';
+  if (isPointOnGreenSurface(bx, by, bz)) return 'green';
+  if (isPointInFairway(bx, bz, hole)) return 'fairway';
+  return 'rough';
+}
+
+function lieLabelJa(lie) {
+  if (lie === 'bunker') return 'バンカー';
+  if (lie === 'green') return 'グリーン';
+  if (lie === 'fairway') return 'フェアウェイ';
+  if (lie === 'rough') return 'ラフ';
+  return lie;
+}
+
 // ===== カップ方向へ自動照準 =====
 function aimAtHole() {
   aimAtGreen();
@@ -1598,7 +1748,8 @@ document.addEventListener('keydown', e => {
       e.preventDefault();
       if (e.repeat && shotState !== SHOT_IDLE) break;
       if (shotState === SHOT_RETURN) queueImpact();
-      else nextShotAction();
+      else if (shotState !== SHOT_DELAY_IMPACT && shotState !== SHOT_DOWN_SWING)
+        nextShotAction();
       break;
     case 'KeyQ':
       changeClub(-1);
